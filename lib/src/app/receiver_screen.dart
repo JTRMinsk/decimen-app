@@ -33,6 +33,9 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
     // Android defaults to 640×480, which cannot resolve a version-40 QR
     // (177 modules, the 2953-byte default). 1080p is the practical minimum.
     cameraResolution: const Size(1920, 1080),
+    // Zoom toward the code once detected — dense frames decode far more
+    // reliably when the phone isn't held close.
+    autoZoom: true,
   );
 
   LTDecoder? _decoder;
@@ -47,6 +50,15 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
   String? _verdictShown;
   int _emptyPayloads = 0;
   int _unusableFrames = 0;
+
+  // Throughput telemetry. seq is monotone per session, so the span between
+  // the smallest and largest seq seen bounds how many frames the sender
+  // showed us; framesNew / span is the catch rate — the number that decides
+  // whether turning the sender up or down would help.
+  int _minSeq = 0;
+  int _maxSeq = -1;
+  int _lastUiMs = 0;
+  String _finishStats = '';
 
   OpticalFile? _resultFile;
   String? _resultSnippet;
@@ -146,7 +158,11 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
           header.k, header.blockLen, header.sessionId, header.totalLen);
       _streamKey = identity;
       _startMs = DateTime.now().millisecondsSinceEpoch;
+      _minSeq = header.seq;
+      _maxSeq = header.seq;
     }
+    if (header.seq < _minSeq) _minSeq = header.seq;
+    if (header.seq > _maxSeq) _maxSeq = header.seq;
     final decoder = _decoder!;
     decoder.addFrame(header.seq, parsed.block);
     _updateProgress(decoder);
@@ -156,24 +172,47 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
   }
 
   void _updateProgress(LTDecoder decoder) {
-    final elapsed =
-        (DateTime.now().millisecondsSinceEpoch - _startMs) / 1000.0;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    // Decodes can arrive at camera rate; repainting the overlay that often
+    // just steals CPU from ML Kit. 4 Hz is plenty for a progress line.
+    if (!decoder.isComplete && nowMs - _lastUiMs < 250) return;
+    _lastUiMs = nowMs;
+    final elapsed = (nowMs - _startMs) / 1000.0;
     final usefulFrames = decoder.framesNew - decoder.framesRedundant;
     final est = estimateTransferProgress(
         decoder.k, usefulFrames, elapsed, decoder.solvedCount);
+    final goodput = elapsed > 0 ? usefulFrames * decoder.blockLen / elapsed : 0.0;
+    final span = _maxSeq - _minSeq + 1;
+    final catchRate = span > 0 ? decoder.framesNew / span : 1.0;
+
+    // Point the user at the sender knob that would actually help.
+    String hint = '';
+    if (elapsed >= 5 && decoder.framesNew >= 20) {
+      if (catchRate < 0.5) {
+        hint = '捕获率偏低：把发送端帧率调低，或拿近一点';
+      } else if (catchRate >= 0.9) {
+        hint = '捕获良好：可提高发送端字节/帧或帧率来加速';
+      }
+    }
+
     setState(() {
       _fraction = est.fraction;
       _progressText =
-          '${(est.fraction * 100).toStringAsFixed(1)}% · ${decoder.solvedCount}/${decoder.k} 块 · ${decoder.framesNew} 帧';
+          '${(est.fraction * 100).toStringAsFixed(1)}% · ${decoder.solvedCount}/${decoder.k} 块 · '
+          '${formatBytes(goodput.round())}/s · 捕获 ${(catchRate * 100).toStringAsFixed(0)}%';
       _etaText = est.etaSeconds == null
-          ? '估算时间…'
-          : '约 ${formatDuration(est.etaSeconds!)}';
+          ? (hint.isEmpty ? '估算时间…' : hint)
+          : '约 ${formatDuration(est.etaSeconds!)}${hint.isEmpty ? '' : ' · $hint'}';
     });
   }
 
   Future<void> _finish(Uint8List container, int payloadFnv) async {
     _done = true;
     await _controller.stop();
+    final seconds =
+        (DateTime.now().millisecondsSinceEpoch - _startMs) / 1000.0;
+    final avg = seconds > 0 ? container.length / seconds : 0.0;
+    _finishStats = '用时 ${formatDuration(seconds)} · 平均 ${formatBytes(avg.round())}/s';
     final hashOk = fnv1a(container) == payloadFnv;
     if (!hashOk) {
       setState(() {
@@ -238,6 +277,10 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
       _verdictShown = null;
       _emptyPayloads = 0;
       _unusableFrames = 0;
+      _minSeq = 0;
+      _maxSeq = -1;
+      _lastUiMs = 0;
+      _finishStats = '';
       _resultFile = null;
       _resultSnippet = null;
       _saveNote = null;
@@ -351,6 +394,8 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             const Text('SHA-256 校验通过 ✓', style: TextStyle(color: Colors.green)),
+            if (_finishStats.isNotEmpty)
+              Text(_finishStats, style: const TextStyle(color: Colors.grey)),
             const SizedBox(height: 16),
             Expanded(
               child: Container(
@@ -403,6 +448,8 @@ class _ReceiverScreenState extends State<ReceiverScreen> {
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Text('${file.name} · ${formatBytes(file.bytes.length)} · SHA-256 校验通过 ✓'),
+            if (_finishStats.isNotEmpty)
+              Text(_finishStats, style: const TextStyle(color: Colors.grey)),
             const SizedBox(height: 16),
             if (file.type.startsWith('image/'))
               Expanded(
